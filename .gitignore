@@ -1,0 +1,38 @@
+# Secrets and Environment Variables
+.env
+.env.*
+!.env.example
+*.env
+
+# Python Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Python Cache & Testing
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Build outputs
+dist/
+build/
+frontend/dist/
+
+# ML artifacts and generated datasets
+artifacts/*.joblib
+artifacts/*.json
+data/*.csv
+
