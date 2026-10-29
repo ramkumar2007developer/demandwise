@@ -91,6 +91,7 @@ export interface CompetitorSearchResponse {
   competitors: CompetitorItem[];
   status: string;
   note?: string | null;
+  is_cached?: boolean;
 }
 
 export interface StartupCostItem {
@@ -183,6 +184,10 @@ export interface CompetitorPreview {
   name: string;
   category: string;
   distance_km?: number | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  osm_id?: number | null;
+  street?: string | null;
 }
 
 export interface StageStatus {
@@ -207,6 +212,8 @@ export interface BusinessAnalysisResponse {
   budget_feasibility?: BudgetSummary | null;
   competitors: CompetitorPreview[];
   competitor_count: number;
+  competitor_status?: 'success' | 'empty' | 'degraded' | 'error';
+  competitor_error?: string | null;
   stages: StageStatus[];
   warnings: string[];
   total_duration_ms: number;

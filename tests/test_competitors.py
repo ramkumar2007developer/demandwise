@@ -338,3 +338,282 @@ def test_api_competitors_returns_502_on_provider_error() -> None:
             },
         )
     assert response.status_code == 502
+
+
+def test_normalize_business_category_aliases() -> None:
+    from app.services.competitors import normalize_business_category
+
+    assert normalize_business_category("hotel") == "hotel"
+    assert normalize_business_category("HOTEL") == "hotel"
+    assert normalize_business_category("hotel/small_restaurant") == "hotel"
+    assert normalize_business_category("restaurant") == "hotel"
+    assert normalize_business_category("lodging") == "hotel"
+    assert normalize_business_category("cafe") == "cafe"
+    assert normalize_business_category("coffee_shop") == "cafe"
+    assert normalize_business_category("retail") == "retail"
+    assert normalize_business_category("shop") == "retail"
+
+
+def test_build_overpass_query_normalizes_hotel_alias() -> None:
+    hotel_alias_query = build_overpass_query(COIMBATORE_LAT, COIMBATORE_LNG, 2000, "hotel/small_restaurant")
+    assert 'tourism"="hotel' in hotel_alias_query
+    assert 'amenity"="restaurant' in hotel_alias_query
+
+
+def test_competitor_preview_contains_coordinates() -> None:
+    from app.schemas.analysis import CompetitorPreview
+
+    preview = CompetitorPreview(
+        name="Taj Surya",
+        category="hotel",
+        distance_km=0.85,
+        latitude=11.0180,
+        longitude=76.9570,
+        osm_id=12345,
+        street="Race Course Road",
+    )
+    assert preview.latitude == 11.0180
+    assert preview.longitude == 76.9570
+    assert preview.osm_id == 12345
+    assert preview.street == "Race Course Road"
+
+
+# ---------------------------------------------------------------------------
+# Unit Tests: Caching Behaviour
+# ---------------------------------------------------------------------------
+
+def test_empty_result_is_not_cached_allowing_retry() -> None:
+    """Empty Overpass responses must NOT be cached so a later retry can find real competitors.
+
+    Guards against: transient mirror glitch returns empty elements list, gets cached 5 min,
+    blocks real results on retry.
+    """
+    from app.services.competitors import _COMPETITOR_CACHE
+
+    empty_payload = {"version": 0.6, "elements": []}
+    lat, lng = 11.05, 76.97
+    cache_key = (round(lat, 3), round(lng, 3), 2000, "cafe")
+    _COMPETITOR_CACHE.pop(cache_key, None)
+
+    client = _mock_httpx_client(empty_payload)
+    result = search_competitors(
+        latitude=lat,
+        longitude=lng,
+        business_type="cafe",
+        http_client=client,
+    )
+    assert result.total_found == 0
+    assert result.status == "empty"
+    assert cache_key not in _COMPETITOR_CACHE, (
+        "Empty results must not be cached; a retry should be allowed to find real competitors."
+    )
+
+
+def test_successful_result_with_competitors_is_cached() -> None:
+    """Results with real competitors must be cached to prevent redundant Overpass requests.
+
+    Caching only occurs in the production path (no injected http_client).
+    Use a mocked httpx.Client to verify the production path writes to cache.
+    """
+    from unittest.mock import patch
+    from app.services.competitors import _COMPETITOR_CACHE
+
+    lat, lng = 11.07, 76.99  # unique coords not used by any other test
+    cache_key = (round(lat, 3), round(lng, 3), 2000, "cafe")
+    _COMPETITOR_CACHE.pop(cache_key, None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code=200, json=MOCK_OVERPASS_ELEMENTS, request=request)
+
+    class MockedClient(httpx.Client):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    settings = Settings(
+        overpass_api_url="https://cache-test-mirror.example.com/api/interpreter",
+        overpass_fallback_urls="",
+        competitor_search_timeout_seconds=10.0,
+        competitor_search_radius_meters=2000,
+    )
+
+    with patch("app.services.competitors.httpx.Client", MockedClient):
+        result = search_competitors(
+            latitude=lat,
+            longitude=lng,
+            business_type="cafe",
+            settings=settings,
+        )
+
+    assert result.total_found > 0
+    assert cache_key in _COMPETITOR_CACHE, (
+        "Non-empty successful results must be cached to prevent redundant Overpass requests."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unit Tests: HTTP Error Variants (502, 503, 504) and non-JSON responses
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status_code", [502, 503, 504])
+def test_search_competitors_handles_gateway_errors(status_code: int) -> None:
+    """HTTP 502/503/504 from an injected mock client must raise CompetitorServiceError."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code=status_code, text="Gateway Error", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(CompetitorServiceError):
+        search_competitors(COIMBATORE_LAT, COIMBATORE_LNG, "cafe", http_client=client)
+
+
+def test_search_competitors_handles_html_response_from_mirror() -> None:
+    """Some Overpass mirrors return HTML error pages on failures; must raise CompetitorServiceError."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        html = "<html><body><h1>Service Unavailable</h1></body></html>"
+        return httpx.Response(status_code=200, text=html, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(CompetitorServiceError, match="Invalid JSON"):
+        search_competitors(COIMBATORE_LAT, COIMBATORE_LNG, "cafe", http_client=client)
+
+
+def test_search_competitors_rate_limit_includes_retry_after() -> None:
+    """HTTP 429 with Retry-After header must raise CompetitorServiceRateLimitError."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code=429,
+            text="Too Many Requests",
+            headers={"Retry-After": "60"},
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(CompetitorServiceRateLimitError, match="rate limit exceeded"):
+        search_competitors(COIMBATORE_LAT, COIMBATORE_LNG, "cafe", http_client=client)
+
+
+# ---------------------------------------------------------------------------
+# Unit Tests: Production Mirror Failover (mocked httpx.Client via patch)
+# ---------------------------------------------------------------------------
+
+def test_production_mirrors_failover_on_first_mirror_timeout() -> None:
+    """When the first mirror times out and the second succeeds, results should be returned."""
+    from unittest.mock import patch
+
+    from app.services.competitors import _COMPETITOR_CACHE
+    _COMPETITOR_CACHE.clear()
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise httpx.TimeoutException("First mirror timed out")
+        return httpx.Response(status_code=200, json=MOCK_OVERPASS_ELEMENTS, request=request)
+
+    class MockedClient(httpx.Client):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    settings = Settings(
+        overpass_api_url="https://mirror1.example.com/api/interpreter",
+        overpass_fallback_urls="https://mirror2.example.com/api/interpreter",
+        competitor_search_timeout_seconds=10.0,
+        competitor_search_radius_meters=2000,
+    )
+
+    with patch("app.services.competitors.httpx.Client", MockedClient):
+        result = search_competitors(
+            latitude=COIMBATORE_LAT,
+            longitude=COIMBATORE_LNG,
+            business_type="cafe",
+            settings=settings,
+        )
+
+    assert result.total_found == 3
+    assert call_count["n"] == 2
+
+
+def test_production_mirrors_all_fail_raises_service_error() -> None:
+    """When all mirrors fail, a CompetitorServiceError or timeout variant must be raised.
+
+    Uses unique coordinates to avoid hitting the in-memory TTL cache from earlier tests.
+    """
+    from unittest.mock import patch
+    from app.services.competitors import _COMPETITOR_CACHE
+
+    # Unique coords not used by any other test to avoid cache hits
+    lat, lng = 11.08, 76.91
+    cache_key = (round(lat, 3), round(lng, 3), 2000, "cafe")
+    _COMPETITOR_CACHE.pop(cache_key, None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("Mirror timed out")
+
+    class MockedClient(httpx.Client):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    settings = Settings(
+        overpass_api_url="https://mirror1.example.com/api/interpreter",
+        overpass_fallback_urls="https://mirror2.example.com/api/interpreter",
+        competitor_search_timeout_seconds=10.0,
+        competitor_search_radius_meters=2000,
+    )
+
+    with patch("app.services.competitors.httpx.Client", MockedClient):
+        with pytest.raises((CompetitorServiceError, CompetitorServiceTimeoutError)):
+            search_competitors(
+                latitude=lat,
+                longitude=lng,
+                business_type="cafe",
+                settings=settings,
+            )
+
+
+def test_production_mirrors_502_skips_to_next_mirror() -> None:
+    """HTTP 502 from the first mirror must cause failover to the next mirror.
+
+    Uses unique coordinates to avoid hitting the in-memory TTL cache from earlier tests.
+    """
+    from unittest.mock import patch
+    from app.services.competitors import _COMPETITOR_CACHE
+
+    # Unique coords not used by any other test to avoid cache hits
+    lat, lng = 11.09, 76.92
+    cache_key = (round(lat, 3), round(lng, 3), 2000, "cafe")
+    _COMPETITOR_CACHE.pop(cache_key, None)
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(status_code=502, text="Bad Gateway", request=request)
+        return httpx.Response(status_code=200, json=MOCK_OVERPASS_ELEMENTS, request=request)
+
+    class MockedClient(httpx.Client):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    settings = Settings(
+        overpass_api_url="https://mirror1.example.com/api/interpreter",
+        overpass_fallback_urls="https://mirror2.example.com/api/interpreter",
+        competitor_search_timeout_seconds=10.0,
+        competitor_search_radius_meters=2000,
+    )
+
+    with patch("app.services.competitors.httpx.Client", MockedClient):
+        result = search_competitors(
+            latitude=lat,
+            longitude=lng,
+            business_type="cafe",
+            settings=settings,
+        )
+
+    assert result.total_found == 3
+    assert call_count["n"] == 2
+

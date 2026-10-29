@@ -118,3 +118,7 @@ class CompetitorSearchResponse(BaseModel):
         default=None,
         description="Operational note (e.g. rate limit retry, empty result clarification).",
     )
+    is_cached: bool = Field(
+        default=False,
+        description="True if response was served from memory or spatial cache.",
+    )

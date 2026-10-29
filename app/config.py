@@ -46,9 +46,16 @@ class Settings(BaseSettings):
     # -----------------------------------------------------------------------
     # Phase 3: External Competitor Search & Retrieval Configuration
     # -----------------------------------------------------------------------
-    overpass_api_url: str = "https://overpass-api.de/api/interpreter"
+    overpass_api_url: str = "https://overpass.openstreetmap.fr/api/interpreter"
+    overpass_fallback_urls: str = (
+        "https://overpass-api.de/api/interpreter,"
+        "https://lz4.overpass-api.de/api/interpreter,"
+        "https://z.overpass-api.de/api/interpreter,"
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter,"
+        "https://overpass.kumi.systems/api/interpreter"
+    )
     competitor_search_radius_meters: int = 2000
-    competitor_search_timeout_seconds: float = 10.0
+    competitor_search_timeout_seconds: float = 20.0
     competitor_search_max_results: int = 50
     competitor_user_agent: str = (
         "DemandWise/1.0.0 (student project; https://github.com/demandwise)"
@@ -105,6 +112,14 @@ class Settings(BaseSettings):
     @property
     def allowed_business_type_list(self) -> list[str]:
         return [item.lower() for item in self._split_csv(self.allowed_business_types)]
+
+    @property
+    def overpass_mirror_list(self) -> list[str]:
+        mirrors = [self.overpass_api_url]
+        for m in self._split_csv(self.overpass_fallback_urls):
+            if m not in mirrors:
+                mirrors.append(m)
+        return mirrors
 
     @property
     def geo_bounds(self) -> dict[str, float]:

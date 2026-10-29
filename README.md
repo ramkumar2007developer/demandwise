@@ -362,3 +362,20 @@ A single `DeprecationWarning` is emitted on test runs:
 The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
 ```
 **Cause**: Starlette `0.41.3` references the deprecated `anyio.abc.BlockingPortal` alias. Upstream issue in Starlette/AnyIO packaging; harmless to runtime and tests.
+
+runing commands :
+
+backend :
+ 
+ # 1. If your terminal is currently inside the frontend folder, move back to root:
+cd c:\Users\Hp\OneDrive\Desktop\demandwise2.0
+
+# 2. Run the FastAPI backend server:
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+
+
+frontend:
+
+cd c:\Users\Hp\OneDrive\Desktop\demandwise2.0\frontend
+npm run dev
+

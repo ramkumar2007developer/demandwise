@@ -312,6 +312,8 @@ def run_business_analysis(body: BusinessAnalysisRequest) -> BusinessAnalysisResp
         budget_feasibility=budget_sum,
         competitors=result.competitor_previews,
         competitor_count=len(result.competitor_previews),
+        competitor_status=result.competitor_status,
+        competitor_error=result.competitor_error,
         stages=stages,
         warnings=result.warnings,
         total_duration_ms=result.total_duration_ms,

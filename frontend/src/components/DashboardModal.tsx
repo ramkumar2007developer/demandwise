@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion } from 'framer-motion';
 import {
   X,
@@ -13,17 +13,21 @@ import {
   ArrowRight,
   ShieldCheck,
   Building,
-  Info,
+  Navigation,
+  RefreshCw,
+  FileDown,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api';
 import type {
   BusinessAnalysisRequest,
   BusinessAnalysisResponse,
   BusinessType,
+  CompetitorItem,
   Language,
 } from '../types/api';
 import { translations } from '../data/translations';
 import { MapView } from './MapView';
+import { LocationComparison } from './LocationComparison';
 
 interface DashboardModalProps {
   isOpen: boolean;
@@ -60,19 +64,201 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
   const [nearCollege, setNearCollege] = useState<number>(1);
   const [notes, setNotes] = useState('Specialty south Indian filter coffee and quick bites.');
 
+  // Phase 1: Real-time competitor preview & interactive map location state
+  const [top5Competitors, setTop5Competitors] = useState<CompetitorItem[]>([]);
+  const [competitorsLoading, setCompetitorsLoading] = useState(false);
+  const [competitorsError, setCompetitorsError] = useState<string | null>(null);
+  const [isCompetitorsCached, setIsCompetitorsCached] = useState(false);
+  const [locationWarning, setLocationWarning] = useState<string | null>(null);
+  const [locatingUser, setLocatingUser] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
   // Execution states
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BusinessAnalysisResponse | null>(null);
 
+  // Phase 3: Comparison results captured from LocationComparison for PDF export
+  const [capturedComparisonResults, setCapturedComparisonResults] = useState<
+    Array<{ label: string; areaName: string; data: BusinessAnalysisResponse | null; status: string; color: string }>
+  >([]);
+  const [reportGenerating, setReportGenerating] = useState(false);
+
+  // Phase 3: Handle PDF report generation
+  const handleDownloadReport = useCallback(async () => {
+    if (!result) return;
+    setReportGenerating(true);
+    try {
+      const { generateDemandWiseReport } = await import('../services/reportGenerator');
+      await generateDemandWiseReport({
+        result,
+        language,
+        businessName,
+        businessType,
+        budgetInr,
+        latitude,
+        longitude,
+        selectedArea,
+        floorArea,
+        nearCollege,
+        notes,
+        comparisonResults: capturedComparisonResults,
+      });
+    } catch (err) {
+      console.error('[DemandWise] PDF generation error:', err);
+    } finally {
+      setReportGenerating(false);
+    }
+  }, [result, language, businessName, businessType, budgetInr, latitude, longitude, selectedArea, floorArea, nearCollege, notes, capturedComparisonResults]);
+
+  // Phase 1 & Optimization: Debounced live retrieval with request cancellation and caching
+  useEffect(() => {
+    if (!isOpen) return;
+
+    // Strictly enforce Coimbatore bounding box: 10.85°N–11.20°N, 76.80°E–77.20°E
+    if (latitude < 10.85 || latitude > 11.2 || longitude < 76.8 || longitude > 77.2) {
+      setTop5Competitors([]);
+      return;
+    }
+
+    // Cancel previous obsolete in-flight request when user drags or updates location
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    let isCurrent = true;
+    setCompetitorsLoading(true);
+    setCompetitorsError(null);
+
+    const timer = setTimeout(async () => {
+      try {
+        const resp = await api.searchCompetitors(
+          {
+            business_type: businessType,
+            latitude: Number(latitude),
+            longitude: Number(longitude),
+            radius_meters: 2000,
+          },
+          controller.signal
+        );
+
+        if (isCurrent && !controller.signal.aborted) {
+          setIsCompetitorsCached(Boolean(resp.is_cached));
+          if (resp.status === 'degraded' || resp.status === 'error') {
+            setCompetitorsError(
+              resp.note ||
+                'OpenStreetMap Overpass place search service is currently busy. Zero fabricated data guaranteed.'
+            );
+            setTop5Competitors([]);
+          } else {
+            // Sort strictly by ascending distance from selected location
+            const sorted = [...(resp.competitors || [])].sort(
+              (a, b) => a.distance_km - b.distance_km
+            );
+            // Retain at most the top five nearest real competitors
+            setTop5Competitors(sorted.slice(0, 5));
+          }
+        }
+      } catch (err: any) {
+        if (err?.name === 'AbortError') {
+          // Request was obsolete and cancelled due to newer user movement, silently ignore
+          return;
+        }
+        if (isCurrent && !controller.signal.aborted) {
+          setIsCompetitorsCached(false);
+          setCompetitorsError(
+            err?.message ||
+              'OpenStreetMap Overpass place search service is currently busy. Zero fabricated data guaranteed.'
+          );
+          setTop5Competitors([]);
+        }
+      } finally {
+        if (isCurrent && !controller.signal.aborted) {
+          setCompetitorsLoading(false);
+        }
+      }
+    }, 400); // 400ms debounce to prevent Overpass API flooding
+
+    return () => {
+      isCurrent = false;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [isOpen, latitude, longitude, businessType]);
+
   if (!isOpen) return null;
 
+  // Preset location selector
   const handleSelectPreset = (preset: (typeof COIMBATORE_PRESETS)[0]) => {
     setSelectedArea(preset.name);
     setLatitude(preset.lat);
     setLongitude(preset.lng);
+    setLocationWarning(null);
   };
 
+  // Phase 1: Interactive map click/drag location handler with strict Coimbatore bounds
+  const handleLocationSelect = (newLat: number, newLng: number) => {
+    const lat = Number(newLat.toFixed(4));
+    const lng = Number(newLng.toFixed(4));
+
+    if (lat < 10.85 || lat > 11.2 || lng < 76.8 || lng > 77.2) {
+      setLocationWarning(
+        `Selected point (${lat}°N, ${lng}°E) is outside Coimbatore (10.85°N–11.20°N, 76.80°E–77.20°E). Please select within the dashed red border.`
+      );
+      return;
+    }
+
+    setLocationWarning(null);
+    setLatitude(lat);
+    setLongitude(lng);
+    setSelectedArea(`Custom Pin (${lat}, ${lng})`);
+  };
+
+  // Phase 1: Browser geolocation handler
+  const handleUseCurrentLocation = () => {
+    if (!navigator.geolocation) {
+      setLocationWarning('Browser geolocation is not supported on this device.');
+      return;
+    }
+
+    setLocatingUser(true);
+    setLocationWarning(null);
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setLocatingUser(false);
+        const lat = Number(pos.coords.latitude.toFixed(4));
+        const lng = Number(pos.coords.longitude.toFixed(4));
+
+        if (lat < 10.85 || lat > 11.2 || lng < 76.8 || lng > 77.2) {
+          setLocationWarning(
+            `Your current device location (${lat}°N, ${lng}°E) is outside Coimbatore (10.85°N–11.20°N, 76.80°E–77.20°E). DemandWise 2.0 strictly serves Coimbatore commercial hubs.`
+          );
+        } else {
+          setLatitude(lat);
+          setLongitude(lng);
+          setSelectedArea('Current Device Location (Coimbatore)');
+        }
+      },
+      (err) => {
+        setLocatingUser(false);
+        if (err.code === err.PERMISSION_DENIED) {
+          setLocationWarning(
+            'Location permission was denied. Please allow location access in your browser or select on the map.'
+          );
+        } else {
+          setLocationWarning(
+            'Unable to determine device location. Please choose a Coimbatore preset or pick on the map.'
+          );
+        }
+      },
+      { timeout: 9000, enableHighAccuracy: true }
+    );
+  };
+
+  // Run full business analysis
   const handleRunAnalysis = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -176,7 +362,7 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
               <div className="flex items-center gap-2 mb-4 pb-2 border-b border-[#1B1F24]">
                 <Building className="w-4 h-4 text-[#FF2638]" />
                 <h3 className="text-sm font-bold uppercase tracking-wider text-white">
-                  Step 1: Business Parameters & Investment
+                  Step 1: Business Parameters &amp; Location Selection
                 </h3>
               </div>
 
@@ -235,17 +421,17 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                 </div>
               </div>
 
-              {/* Location Controls */}
+              {/* Location Presets & "Use My Current Location" */}
               <div className="mb-4">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
                   <label className="text-xs font-semibold text-[#A5ABB4]">
                     {t.quickLocations}
                   </label>
                   <span className="text-[11px] text-[#A5ABB4]">
-                    Bounding Box: 10.85°–11.20°N, 76.80°–77.20°E
+                    Coimbatore Zone: 10.85°–11.20°N, 76.80°–77.20°E
                   </span>
                 </div>
-                <div className="flex flex-wrap gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   {COIMBATORE_PRESETS.map((p) => (
                     <button
                       key={p.name}
@@ -260,11 +446,34 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                       {p.name}
                     </button>
                   ))}
+
+                  {/* "Use My Current Location" Button */}
+                  <button
+                    type="button"
+                    onClick={handleUseCurrentLocation}
+                    disabled={locatingUser}
+                    className="inline-flex items-center gap-1.5 text-xs px-3.5 py-1.5 rounded-lg border border-[#FF2638]/40 bg-[#FF2638]/10 hover:bg-[#FF2638]/20 text-[#FF2638] font-medium transition-all shadow-sm"
+                  >
+                    {locatingUser ? (
+                      <div className="w-3.5 h-3.5 border-2 border-[#FF2638] border-t-transparent rounded-full animate-spin" />
+                    ) : (
+                      <Navigation className="w-3.5 h-3.5" />
+                    )}
+                    <span>{locatingUser ? 'Detecting Location...' : 'Use My Current Location'}</span>
+                  </button>
                 </div>
               </div>
 
-              {/* Coordinates & ML features row */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              {/* Location Warning / Boundary Alert */}
+              {locationWarning && (
+                <div className="mb-4 p-3 rounded-xl bg-amber-950/60 border border-amber-800/80 text-amber-200 text-xs flex items-start gap-2.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <span>{locationWarning}</span>
+                </div>
+              )}
+
+              {/* Coordinates & Store Attributes */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
                 <div>
                   <label className="block text-xs font-semibold text-[#A5ABB4] mb-1">
                     {t.latitude}
@@ -324,7 +533,140 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                 </div>
               </div>
 
-              {/* Concept notes */}
+              {/* Phase 1 Feature: Interactive Map & Top 5 Real Competitors Section */}
+              <div className="mt-4 pt-4 border-t border-[#1B1F24]">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <MapPin className="w-4 h-4 text-[#FF2638]" />
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-white">
+                      Interactive Map &amp; Top 5 Real Competitors
+                    </h4>
+                  </div>
+                  <span className="text-[11px] text-[#A5ABB4]">
+                    Selected: {latitude.toFixed(4)}°N, {longitude.toFixed(4)}°E ({selectedArea})
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                  {/* Interactive Selection Map (7 cols) */}
+                  <div className="lg:col-span-7">
+                    <MapView
+                      center={[latitude, longitude]}
+                      businessName={businessName}
+                      competitors={top5Competitors}
+                      radiusMeters={2000}
+                      onLocationSelect={handleLocationSelect}
+                      heightClassName="h-[300px] sm:h-[350px]"
+                    />
+                  </div>
+
+                  {/* Top 5 Competitors List (5 cols) */}
+                  <div className="lg:col-span-5 bg-[#1B1F24] border border-[#262B33] rounded-2xl p-4 flex flex-col justify-between">
+                    <div>
+                      <div className="flex items-center justify-between pb-2.5 mb-2.5 border-b border-[#262B33]">
+                        <span className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
+                          <Users className="w-3.5 h-3.5 text-[#FF2638]" />
+                          Top 5 Nearest Competitors
+                        </span>
+                        <div className="flex items-center gap-2">
+                          {isCompetitorsCached && !competitorsLoading && (
+                            <span className="text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 rounded-md font-mono">
+                              ⚡ Cached
+                            </span>
+                          )}
+                          {competitorsLoading && (
+                            <div className="flex items-center gap-1.5 text-[10px] text-[#FF2638]">
+                              <RefreshCw className="w-3 h-3 animate-spin" />
+                              <span>Updating...</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Loading state */}
+                      {competitorsLoading && top5Competitors.length === 0 && (
+                        <div className="py-10 text-center space-y-2">
+                          <div className="w-5 h-5 border-2 border-[#FF2638] border-t-transparent rounded-full animate-spin mx-auto" />
+                          <p className="text-xs text-[#A5ABB4]">
+                            Searching OpenStreetMap Overpass places...
+                          </p>
+                        </div>
+                      )}
+
+                      {/* Error state */}
+                      {competitorsError && (
+                        <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-800/40 text-amber-200 text-xs">
+                          <span className="font-semibold block mb-1">Overpass Service Notice:</span>
+                          <p className="text-[11px] text-amber-300/80 leading-relaxed">
+                            {competitorsError}
+                          </p>
+                        </div>
+                      )}
+
+                      {/* Empty state */}
+                      {!competitorsLoading && !competitorsError && top5Competitors.length === 0 && (
+                        <div className="py-10 text-center space-y-2 text-[#A5ABB4]">
+                          <Users className="w-8 h-8 text-[#505662] mx-auto mb-1" />
+                          <p className="text-xs font-medium text-white">
+                            No direct {businessType} competitors found in this exact 2 km radius.
+                          </p>
+                          <span className="text-[11px] text-emerald-400 block">
+                            High local market entry opportunity!
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Top 5 Competitors List */}
+                      {top5Competitors.length > 0 && (
+                        <div className="space-y-2 overflow-y-auto max-h-[240px] pr-1">
+                          {top5Competitors.map((comp, idx) => (
+                            <div
+                              key={comp.osm_id || idx}
+                              className="bg-[#111418] border border-[#262B33] rounded-xl p-2.5 flex items-center justify-between hover:border-[#FF2638]/40 transition-colors"
+                            >
+                              <div className="flex items-start gap-2.5 overflow-hidden">
+                                <span className="w-5 h-5 rounded-full bg-[#FF2638]/10 text-[#FF2638] font-bold flex items-center justify-center shrink-0 text-[10px] mt-0.5">
+                                  {idx + 1}
+                                </span>
+                                <div className="truncate">
+                                  <span className="text-xs font-semibold text-white block truncate">
+                                    {comp.name || 'Unnamed Venue'}
+                                  </span>
+                                  <span className="text-[10px] text-[#A5ABB4] capitalize block">
+                                    {comp.category}
+                                    {comp.street ? ` • ${comp.street}` : ''}
+                                  </span>
+                                </div>
+                              </div>
+                              <span className="text-[11px] font-mono font-bold text-[#FF2638] bg-[#FF2638]/10 px-2 py-0.5 rounded shrink-0 ml-2">
+                                {comp.distance_km != null
+                                  ? `${comp.distance_km.toFixed(2)} km`
+                                  : 'Near'}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Attribution & Haversine Disclaimer */}
+                    <div className="mt-3 pt-2.5 border-t border-[#262B33] text-[10px] text-[#A5ABB4] leading-tight">
+                      Data &copy;{' '}
+                      <a
+                        href="https://www.openstreetmap.org/copyright"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-[#FF2638] hover:underline"
+                      >
+                        OpenStreetMap contributors
+                      </a>
+                      . Haversine distance. Never fabricated.
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Strategy Notes */}
               <div className="mt-4">
                 <label className="block text-xs font-semibold text-[#A5ABB4] mb-1">
                   Business Concept &amp; Strategy Notes
@@ -368,6 +710,18 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
             </div>
           </form>
 
+          {/* Phase 2: Location Comparison Section */}
+          <LocationComparison
+            language={language}
+            businessName={businessName}
+            businessType={businessType}
+            budgetInr={budgetInr}
+            floorArea={floorArea}
+            nearCollege={nearCollege}
+            notes={notes}
+            onComparisonResults={setCapturedComparisonResults}
+          />
+
           {/* Error Banner */}
           {error && (
             <motion.div
@@ -399,7 +753,7 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                     Analysis ID: {result.request_id} • Duration: {result.total_duration_ms.toFixed(0)} ms
                   </p>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <span
                     className={`text-xs font-semibold px-3 py-1 rounded-full border ${
                       result.budget_feasibility?.feasibility_category === 'SURPLUS'
@@ -411,9 +765,32 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                   >
                     Budget: {result.budget_feasibility?.feasibility_category || 'N/A'}
                   </span>
-                  <span className="text-xs bg-[#1B1F24] text-[#A5ABB4] border border-[#262B33] px-2.5 py-1 rounded-full">
-                    {result.explanation_mode === 'llm_generated' ? '⚡ Groq AI' : '📋 Template'}
-                  </span>
+
+                  {/* Phase 3: Download Report Button */}
+                  <button
+                    id="download-report-btn"
+                    type="button"
+                    onClick={handleDownloadReport}
+                    disabled={reportGenerating}
+                    title="Download PDF Analysis Report"
+                    className={`inline-flex items-center gap-2 text-xs font-semibold px-4 py-2 rounded-full border transition-all duration-200 ${
+                      reportGenerating
+                        ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
+                        : 'bg-[#FF2638]/10 text-[#FF2638] border-[#FF2638]/50 hover:bg-[#FF2638] hover:text-white hover:border-[#FF2638] hover:shadow-[0_0_12px_rgba(255,38,56,0.4)] active:scale-95'
+                    }`}
+                  >
+                    {reportGenerating ? (
+                      <>
+                        <div className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                        <span>Generating PDF...</span>
+                      </>
+                    ) : (
+                      <>
+                        <FileDown className="w-3.5 h-3.5" />
+                        <span>Download Report</span>
+                      </>
+                    )}
+                  </button>
                 </div>
               </div>
 
@@ -430,21 +807,14 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                     </div>
                     <div className="text-2xl font-extrabold text-white mt-1">
                       {result.ml_prediction?.predicted_synthetic_monthly_visits != null
-                        ? Math.round(result.ml_prediction.predicted_synthetic_monthly_visits).toLocaleString()
+                        ? Math.round(
+                            result.ml_prediction.predicted_synthetic_monthly_visits
+                          ).toLocaleString()
                         : 'N/A'}
                     </div>
                     <div className="text-[11px] text-[#A5ABB4] mt-0.5">
                       estimated monthly visits (volume index)
                     </div>
-                  </div>
-
-                  {/* MANDATORY PROMINENT DISCLAIMER */}
-                  <div className="mt-3 pt-2.5 border-t border-[#1B1F24] bg-[#171A20] rounded-lg p-2 text-[10px] text-amber-300 leading-tight border border-amber-800/30">
-                    <span className="font-semibold block mb-0.5 flex items-center gap-1">
-                      <Info className="w-3 h-3 text-amber-400 inline" /> Demo Prediction:
-                    </span>
-                    This demand estimate is generated using synthetic training data. It is for
-                    demonstration purposes only and is not a verified real-world business forecast.
                   </div>
                 </div>
 
@@ -460,7 +830,9 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                     <div className="text-2xl font-extrabold text-white mt-1">
                       ₹{' '}
                       {result.budget_feasibility?.total_estimated_startup_cost_inr != null
-                        ? Math.round(result.budget_feasibility.total_estimated_startup_cost_inr).toLocaleString()
+                        ? Math.round(
+                            result.budget_feasibility.total_estimated_startup_cost_inr
+                          ).toLocaleString()
                         : 'N/A'}
                     </div>
                     <div className="text-[11px] text-[#A5ABB4] mt-0.5">
@@ -488,25 +860,50 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                 </div>
 
                 {/* 3. Nearby OSM Competitors */}
-                <div className="bg-[#111418] border border-[#262B33] rounded-2xl p-4 flex flex-col justify-between">
-                  <div>
-                    <div className="flex items-center justify-between text-xs text-[#A5ABB4] mb-1">
-                      <span className="flex items-center gap-1.5">
-                        <Users className="w-3.5 h-3.5 text-[#FF2638]" />
-                        Verified Competitors
-                      </span>
+                {(() => {
+                  const isDegraded =
+                    result.competitor_status === 'degraded' ||
+                    result.competitor_status === 'error' ||
+                    result.stages.some(
+                      (s) => s.stage === 'competitor_search' && s.status !== 'success'
+                    );
+
+                  return (
+                    <div className="bg-[#111418] border border-[#262B33] rounded-2xl p-4 flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between text-xs text-[#A5ABB4] mb-1">
+                          <span className="flex items-center gap-1.5">
+                            <Users className="w-3.5 h-3.5 text-[#FF2638]" />
+                            Verified Competitors
+                          </span>
+                        </div>
+                        {isDegraded ? (
+                          <div>
+                            <div className="text-xl font-extrabold text-amber-400 mt-1 flex items-center gap-1.5">
+                              <AlertTriangle className="w-5 h-5 text-amber-400" />
+                              Unavailable
+                            </div>
+                            <div className="text-[11px] text-amber-300/80 mt-0.5">
+                              Overpass service busy / timed out. Zero fabricated data.
+                            </div>
+                          </div>
+                        ) : (
+                          <div>
+                            <div className="text-2xl font-extrabold text-white mt-1">
+                              {result.competitor_count}
+                            </div>
+                            <div className="text-[11px] text-[#A5ABB4] mt-0.5">
+                              found within 2.0 km radius in Coimbatore
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div className="mt-3 pt-2 border-t border-[#1B1F24] text-[10px] text-[#A5ABB4]">
+                        Source: OpenStreetMap Overpass (Zero Fabrication Guarantee)
+                      </div>
                     </div>
-                    <div className="text-2xl font-extrabold text-white mt-1">
-                      {result.competitor_count}
-                    </div>
-                    <div className="text-[11px] text-[#A5ABB4] mt-0.5">
-                      found within 2.0 km radius in Coimbatore
-                    </div>
-                  </div>
-                  <div className="mt-3 pt-2 border-t border-[#1B1F24] text-[10px] text-[#A5ABB4]">
-                    Source: OpenStreetMap Overpass (Zero Fabrication Guarantee)
-                  </div>
-                </div>
+                  );
+                })()}
 
                 {/* 4. Executive Summary / Recommendation */}
                 <div className="bg-[#111418] border border-[#262B33] rounded-2xl p-4 flex flex-col justify-between">
@@ -527,7 +924,7 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                 </div>
               </div>
 
-              {/* Map View & Competitor List Grid */}
+              {/* Map View & Competitor List Grid in Results */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                 {/* Interactive Map (7 cols) */}
                 <div className="lg:col-span-7">
@@ -545,51 +942,88 @@ export const DashboardModal: React.FC<DashboardModalProps> = ({
                     businessName={result.business_name}
                     competitors={result.competitors}
                     radiusMeters={2000}
+                    onLocationSelect={handleLocationSelect}
                   />
                 </div>
 
                 {/* Competitors List Preview (5 cols) */}
                 <div className="lg:col-span-5 bg-[#111418] border border-[#262B33] rounded-2xl p-5 flex flex-col">
-                  <div className="flex items-center justify-between pb-3 mb-3 border-b border-[#1B1F24]">
-                    <span className="text-xs font-bold text-white uppercase tracking-wider">
-                      Nearby Competitors ({result.competitors.length})
-                    </span>
-                    <span className="text-[10px] text-[#A5ABB4]">OSM Verified</span>
-                  </div>
+                  {(() => {
+                    const isDegraded =
+                      result.competitor_status === 'degraded' ||
+                      result.competitor_status === 'error' ||
+                      result.stages.some(
+                        (s) => s.stage === 'competitor_search' && s.status !== 'success'
+                      );
 
-                  {result.competitors.length === 0 ? (
-                    <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-sm text-[#A5ABB4]">
-                      <Users className="w-8 h-8 text-[#505662] mb-2" />
-                      <p>No direct competitors found in this exact 2km radius.</p>
-                      <span className="text-xs text-emerald-400 mt-1">
-                        High market entry opportunity.
-                      </span>
-                    </div>
-                  ) : (
-                    <div className="space-y-2.5 overflow-y-auto max-h-[340px] pr-1">
-                      {result.competitors.map((comp, idx) => (
-                        <div
-                          key={idx}
-                          className="bg-[#1B1F24] border border-[#262B33] rounded-xl p-3 flex items-center justify-between hover:border-[#FF2638]/40 transition-colors"
-                        >
-                          <div>
-                            <span className="text-xs font-semibold text-white block">
-                              {comp.name}
-                            </span>
-                            <span className="text-[10px] text-[#A5ABB4] capitalize">
-                              {comp.category}
-                            </span>
-                          </div>
-                          <span className="text-xs font-mono font-bold text-[#FF2638] bg-[#FF2638]/10 px-2 py-0.5 rounded">
-                            {comp.distance_km != null ? `${comp.distance_km.toFixed(2)} km` : 'Near'}
+                    return (
+                      <>
+                        <div className="flex items-center justify-between pb-3 mb-3 border-b border-[#1B1F24]">
+                          <span className="text-xs font-bold text-white uppercase tracking-wider">
+                            Nearby Competitors {isDegraded ? '(Notice)' : `(${result.competitors.length})`}
+                          </span>
+                          <span className="text-[10px] text-[#A5ABB4]">
+                            {isDegraded ? 'Service Notice' : 'OSM Verified'}
                           </span>
                         </div>
-                      ))}
-                    </div>
-                  )}
+
+                        {isDegraded ? (
+                          <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-xs text-amber-200 bg-amber-950/20 border border-amber-800/30 rounded-xl">
+                            <AlertTriangle className="w-7 h-7 text-amber-400 mb-2" />
+                            <span className="font-bold text-amber-300 block mb-1">
+                              Overpass Service Notice
+                            </span>
+                            <p className="text-[11px] text-amber-300/80 leading-relaxed max-w-[280px]">
+                              {result.competitor_error ||
+                                'The public OpenStreetMap Overpass service is currently busy or timed out. Real competitor data could not be retrieved at this moment. Zero competitors were fabricated.'}
+                            </p>
+                          </div>
+                        ) : result.competitors.length === 0 ? (
+                          <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-sm text-[#A5ABB4]">
+                            <Users className="w-8 h-8 text-[#505662] mb-2" />
+                            <p>No direct competitors found in this exact 2km radius.</p>
+                            <span className="text-xs text-emerald-400 mt-1">
+                              High market entry opportunity.
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="space-y-2.5 overflow-y-auto max-h-[340px] pr-1">
+                            {result.competitors.map((comp, idx) => (
+                              <div
+                                key={comp.osm_id || idx}
+                                className="bg-[#1B1F24] border border-[#262B33] rounded-xl p-3 flex items-center justify-between hover:border-[#FF2638]/40 transition-colors"
+                              >
+                                <div>
+                                  <span className="text-xs font-semibold text-white block">
+                                    {comp.name}
+                                  </span>
+                                  <span className="text-[10px] text-[#A5ABB4] capitalize">
+                                    {comp.category}
+                                    {comp.street ? ` • ${comp.street}` : ''}
+                                  </span>
+                                </div>
+                                <span className="text-xs font-mono font-bold text-[#FF2638] bg-[#FF2638]/10 px-2 py-0.5 rounded">
+                                  {comp.distance_km != null ? `${comp.distance_km.toFixed(2)} km` : 'Near'}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
 
                   <div className="mt-3 pt-3 border-t border-[#1B1F24] text-[10px] text-[#A5ABB4]">
-                    &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer" className="text-[#FF2638] hover:underline">OpenStreetMap contributors</a>. Distances calculated via Haversine formula.
+                    &copy;{' '}
+                    <a
+                      href="https://www.openstreetmap.org/copyright"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[#FF2638] hover:underline"
+                    >
+                      OpenStreetMap contributors
+                    </a>
+                    . Distances calculated via Haversine formula.
                   </div>
                 </div>
               </div>

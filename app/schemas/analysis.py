@@ -128,6 +128,10 @@ class CompetitorPreview(BaseModel):
     name: str
     category: str
     distance_km: float | None = None
+    latitude: float | None = Field(default=None, description="Competitor latitude for map rendering.")
+    longitude: float | None = Field(default=None, description="Competitor longitude for map rendering.")
+    osm_id: int | None = Field(default=None, description="OSM element ID.")
+    street: str | None = Field(default=None, description="Street name if available.")
 
 
 class StageStatus(BaseModel):
@@ -204,6 +208,14 @@ class BusinessAnalysisResponse(BaseModel):
     )
     competitors: list[CompetitorPreview] = Field(default_factory=list)
     competitor_count: int = Field(default=0, description="Number of verified nearby competitors.")
+    competitor_status: str = Field(
+        default="success",
+        description="Status of competitor search: 'success', 'empty', 'degraded', or 'error'.",
+    )
+    competitor_error: str | None = Field(
+        default=None,
+        description="Error detail if competitor search degraded or failed.",
+    )
 
     # Observability
     stages: list[StageStatus] = Field(

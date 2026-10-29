@@ -67,6 +67,8 @@ class OrchestrationResult:
     # Competitor previews for the response
     competitor_previews: list[CompetitorPreview] = field(default_factory=list)
     competitor_names: list[str] = field(default_factory=list)
+    competitor_status: str = "success"
+    competitor_error: str | None = None
 
     # Observability
     stages: list[StageResult] = field(default_factory=list)
@@ -161,9 +163,15 @@ def run_analysis(
                     name=c.name,
                     category=c.category,
                     distance_km=c.distance_km,
+                    latitude=c.latitude,
+                    longitude=c.longitude,
+                    osm_id=c.osm_id,
+                    street=c.street,
                 )
             )
             result.competitor_names.append(c.name)
+
+        result.competitor_status = "empty" if comp_res.total_found == 0 else "success"
 
         result.stages.append(StageResult(
             stage="competitor_search",
@@ -172,6 +180,8 @@ def run_analysis(
         ))
     except Exception as exc:
         logger.warning("Competitor search failed during orchestration: %s", exc)
+        result.competitor_status = "degraded"
+        result.competitor_error = str(exc)
         result.stages.append(StageResult(
             stage="competitor_search",
             status="degraded",

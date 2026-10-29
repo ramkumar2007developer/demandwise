@@ -1,13 +1,16 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, lazy, Suspense } from 'react';
 import { Navbar } from './components/Navbar';
 import { Hero } from './components/Hero';
 import { Features } from './components/Features';
 import { HowItWorks } from './components/HowItWorks';
 import { AnalyticsPreview } from './components/AnalyticsPreview';
-import { DashboardModal } from './components/DashboardModal';
 import type { Language } from './data/translations';
 import { api } from './services/api';
 import { X, Play } from 'lucide-react';
+
+const DashboardModal = lazy(() =>
+  import('./components/DashboardModal').then((m) => ({ default: m.DashboardModal }))
+);
 
 export function App() {
   const [language, setLanguage] = useState<Language>('en');
@@ -86,12 +89,16 @@ export function App() {
       </main>
 
       {/* Interactive Business Analysis Dashboard Modal */}
-      <DashboardModal
-        isOpen={dashboardOpen}
-        onClose={() => setDashboardOpen(false)}
-        language={language}
-        onLanguageChange={setLanguage}
-      />
+      {dashboardOpen && (
+        <Suspense fallback={null}>
+          <DashboardModal
+            isOpen={dashboardOpen}
+            onClose={() => setDashboardOpen(false)}
+            language={language}
+            onLanguageChange={setLanguage}
+          />
+        </Suspense>
+      )}
 
       {/* Watch Demo Modal */}
       {demoModalOpen && (
